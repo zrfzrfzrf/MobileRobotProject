@@ -84,9 +84,11 @@ ARM_SAFE = [0.0, 0.87, 1.57, 0.0, -1.57, 0.0]
 # shelves.yaml: tool tip 0.34 m ahead of base_link and level with the cube top
 # (z = 0.38 m). NOT yet tried in the simulator; verify, then nudge by hand.
 ARM_PICK = [-0.059, 1.274, 1.568, 0.0, 0.293, 0.0]
-# Both boxes are approached with the same stand-off, so the cube is carried back
-# to the same spot relative to the robot, which is now above the target box.
-ARM_PLACE = ARM_PICK
+# The cube hangs under the tool tip, so it lands where the tip is. The target box
+# (1.0 x 0.5 m) has its near edge only ~0.22 m ahead of the robot and its centre at
+# 0.47 m, which the arm cannot reach with the tool pointing down (limit ~0.43 m).
+# Tip at 0.40 m ahead, z = 0.39 m: ~15 cm inside the near edge.
+ARM_PLACE = [0.0, 1.498, 2.098, 0.0, 0.6, 0.0]
 
 # Hover 12 cm above ARM_PICK. Going straight from ARM_SAFE to ARM_PICK can sweep
 # the tool through the box; move here first, then down (and back up after).
