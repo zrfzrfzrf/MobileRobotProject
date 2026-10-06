@@ -111,13 +111,46 @@ def generate_launch_description():
                    '--timeout', '300'],
     )
 
-    # TODO: Navigation Layer
+    # Map server. Serves /map to Nav2's static costmap layer. It is a lifecycle
+    # node, so a lifecycle manager has to configure and activate it.
+    map_server = Node(
+        package='nav2_map_server',
+        executable='map_server',
+        name='map_server',
+        output='screen',
+        parameters=[{
+            'yaml_filename': os.path.join(pkg_share, 'maps', 'warehouse.yaml'),
+            'use_sim_time': True,
+        }],
+    )
+    map_lifecycle_manager = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_map',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'autostart': True,
+            'node_names': ['map_server'],
+        }],
+    )
+
+    # Navigation layer. TurtleBot4's own nav2.launch.py wraps nav2_bringup's
+    # navigation_launch.py (planner, controller, behaviors, bt_navigator, ...)
+    # and its own lifecycle manager. The parameter file is our copy in
+    # config/nav2_params.yaml (Pure Pursuit instead of MPPI), so tune it there.
+    nav2 = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(
+            get_package_share_directory('turtlebot4_navigation'),
+            'launch', 'nav2.launch.py')),
+        launch_arguments={
+            'use_sim_time': 'true',
+            'params_file': os.path.join(pkg_share, 'config', 'nav2_params.yaml'),
+        }.items(),
+    )
 
     # TODO: AMCL. For A grade only. The other grades get map -> odom from the static publisher
     # above, which is exact. Remember to launch amcl only for A grade.
-
-    # TODO: Map server.
-    # NOTE: We provide a map at src/Warehouse_robot/warehouse_inventory_robot/maps
 
     # TODO: You might also want to wait for map server and/or amcl to be ready.
     #
@@ -150,6 +183,9 @@ def generate_launch_description():
                 on_exit=[
                     arm_traj_spawner,
                     static_map_to_odom,
+                    map_server,
+                    map_lifecycle_manager,
+                    nav2,
                 ],
             )
         ),
