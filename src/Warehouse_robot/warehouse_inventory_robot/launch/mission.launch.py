@@ -1,7 +1,8 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, RegisterEventHandler
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
+                            RegisterEventHandler)
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.conditions import IfCondition, UnlessCondition
@@ -9,6 +10,31 @@ from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJ
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
+
+
+def lifecycle_activator(name, nodes):
+    """Bring lifecycle nodes to `active`, one by one, retrying until they get there.
+
+    Stands in for nav2_lifecycle_manager, which gives each change_state call a
+    hardcoded deadline: on a loaded machine (Gazebo loading meshes, software
+    rendering) a node's reply misses it ("failed to send response to
+    /<node>/change_state"), the manager gives up, and the node stays
+    `unconfigured`/`inactive` for good -- no /map, or no navigation at all.
+    `ros2 lifecycle set` waits as long as it takes, and the loop re-checks the
+    real state, so a transition that was only slow is not mistaken for a failure.
+    """
+    script = (
+        'for n in ' + ' '.join(nodes) + '; do ok=0; '
+        'for i in $(seq 1 90); do '
+        'st=$(ros2 lifecycle get /$n 2>/dev/null); '
+        'case "$st" in '
+        'active*) ok=1; break;; '
+        'unconfigured*) ros2 lifecycle set /$n configure >/dev/null 2>&1;; '
+        'inactive*) ros2 lifecycle set /$n activate >/dev/null 2>&1;; '
+        'esac; sleep 2; done; '
+        'if [ $ok = 1 ]; then echo "$n: active"; '
+        'else echo "$n never became active" >&2; exit 1; fi; done')
+    return ExecuteProcess(cmd=['bash', '-c', script], name=name, output='screen')
 
 
 def generate_launch_description():
@@ -123,31 +149,32 @@ def generate_launch_description():
             'use_sim_time': True,
         }],
     )
-    map_lifecycle_manager = Node(
-        package='nav2_lifecycle_manager',
-        executable='lifecycle_manager',
-        name='lifecycle_manager_map',
-        output='screen',
-        parameters=[{
-            'use_sim_time': True,
-            'autostart': True,
-            'node_names': ['map_server'],
-        }],
-    )
+    map_lifecycle_manager = lifecycle_activator('activate_map_server', ['map_server'])
 
-    # Navigation layer. TurtleBot4's own nav2.launch.py wraps nav2_bringup's
-    # navigation_launch.py (planner, controller, behaviors, bt_navigator, ...)
-    # and its own lifecycle manager. The parameter file is our copy in
+    # Navigation layer: nav2_bringup's navigation_launch.py (planner, controller,
+    # behaviors, bt_navigator, ...). The parameter file is our copy in
     # config/nav2_params.yaml (Pure Pursuit instead of MPPI), so tune it there.
+    #
+    # autostart is off: its lifecycle manager is the component that fails on a
+    # loaded machine (see lifecycle_activator), and its 4 s heartbeat deadline is
+    # too tight for a simulation running below real time -- the first planning
+    # request starved collision_monitor's heartbeat and the manager shut the whole
+    # stack down ("CRITICAL FAILURE: SERVER collision_monitor IS DOWN").
     nav2 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
-            get_package_share_directory('turtlebot4_navigation'),
-            'launch', 'nav2.launch.py')),
+            get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')),
         launch_arguments={
             'use_sim_time': 'true',
             'params_file': os.path.join(pkg_share, 'config', 'nav2_params.yaml'),
+            'use_composition': 'False',
+            'autostart': 'false',
         }.items(),
     )
+    # Same node list as navigation_launch.py (Jazzy), in startup order.
+    nav2_lifecycle_manager = lifecycle_activator('activate_nav2', [
+        'controller_server', 'smoother_server', 'planner_server', 'route_server',
+        'behavior_server', 'velocity_smoother', 'collision_monitor', 'bt_navigator',
+        'waypoint_follower', 'docking_server'])
 
     # TODO: AMCL. For A grade only. The other grades get map -> odom from the static publisher
     # above, which is exact. Remember to launch amcl only for A grade.
@@ -186,6 +213,7 @@ def generate_launch_description():
                     map_server,
                     map_lifecycle_manager,
                     nav2,
+                    nav2_lifecycle_manager,
                 ],
             )
         ),

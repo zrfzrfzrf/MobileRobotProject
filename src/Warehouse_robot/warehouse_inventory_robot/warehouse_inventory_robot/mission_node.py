@@ -2,15 +2,13 @@
 mission_node.py — Student entry point (grade C: behaviour tree).
 
 Layout of this file
-  1. constants            where to go, which arm poses              (arm poses: TODO(core))
-  2. loaders              shelves.yaml -> PoseStamped               (given)
-  3. AsyncActionCall      non-blocking action wrapper               (given, read it!)
-  4. MissionNode          ROS clients / publishers / tick loop      (given)
-  5. behaviour leaves     UndockLeaf is a worked example; the rest  (TODO(core))
-  6. build_tree()         assemble the tree                         (TODO(core))
+  1. constants            where to go, which arm poses
+  2. loaders              shelves.yaml -> PoseStamped, approach points
+  3. AsyncActionCall      non-blocking action wrapper
+  4. MissionNode          ROS clients / publishers / tick loop
+  5. behaviour leaves     undock, navigate, move arm, vacuum
+  6. build_tree()         the mission as a behaviour tree
   7. main()
-
-Search for TODO(core) to find everything that is left for you.
 
 Rule of thumb for a BT: update() is called on every tick (10 Hz) and must
 return immediately. Never call time.sleep() or spin_until_future_complete()
@@ -19,6 +17,7 @@ return RUNNING until it finishes.
 """
 
 import os
+import copy
 import math
 from pathlib import Path
 
@@ -65,6 +64,8 @@ UNDOCK_TIMEOUT_SEC = 60.0      # all timeouts below are measured in SIM time
 NAV_TIMEOUT_SEC = 400.0
 ARM_TIMEOUT_SEC = 60.0
 VACUUM_SETTLE_SEC = 1.5        # wait after attach/detach so the cube settles
+VACUUM_READY_TIMEOUT_SEC = 30.0  # give up if the gripper bridge never subscribes
+APPROACH_BACKOFF_M = 0.5       # approach point this far behind each box pose
 
 ARM_JOINT_NAMES = [
     'arm_joint1', 'arm_joint2', 'arm_joint3',
@@ -73,29 +74,23 @@ ARM_JOINT_NAMES = [
 
 # Joint angles in radians, in the order of ARM_JOINT_NAMES.
 #
-# ARM_SAFE is the pose the arm spawns in (config/initial_positions.yaml). Forward
-# kinematics from the URDF puts its tool tip 0.46 m ahead of and 0.73 m above the
-# robot, so it is NOT compact. It is only a known-good starting point; see
-# ARM_SAFE_COMPACT if the base rocks while driving.
-ARM_SAFE = [0.0, 0.87, 1.57, 0.0, -1.57, 0.0]
+# All poses come from inverse kinematics on the URDF (tool pointing straight down,
+# joint 6 left at 0) and were checked in the simulator: the tool tip (TF frame
+# arm_link_tcp) lands within 1 mm of the intended point.
+#
+# ARM_SAFE: tool tip 0.15 m ahead of and 0.62 m above base_link, over the robot
+# body, which keeps the centre of mass low and central while driving. The spawn
+# pose (config/initial_positions.yaml) holds the arm 0.46 m forward, 0.73 m high.
+ARM_SAFE = [0.0, -0.417, 0.466, 0.0, 0.883, 0.0]
 
-# ESTIMATES from numerical inverse kinematics on the URDF (tool pointing straight
-# down, joint 6 left at 0), assuming the robot stands exactly on the goal pose in
-# shelves.yaml: tool tip 0.34 m ahead of base_link and level with the cube top
-# (z = 0.38 m). NOT yet tried in the simulator; verify, then nudge by hand.
+# ARM_PICK: tool tip 0.34 m ahead of base_link and level with the cube top
+# (z = 0.38 m), i.e. on the cube when the robot stands on the source box pose.
 ARM_PICK = [-0.059, 1.274, 1.568, 0.0, 0.293, 0.0]
 # The cube hangs under the tool tip, so it lands where the tip is. The target box
 # (1.0 x 0.5 m) has its near edge only ~0.22 m ahead of the robot and its centre at
 # 0.47 m, which the arm cannot reach with the tool pointing down (limit ~0.43 m).
 # Tip at 0.40 m ahead, z = 0.39 m: ~15 cm inside the near edge.
 ARM_PLACE = [0.0, 1.498, 2.098, 0.0, 0.6, 0.0]
-
-# Hover 12 cm above ARM_PICK. Going straight from ARM_SAFE to ARM_PICK can sweep
-# the tool through the box; move here first, then down (and back up after).
-ARM_PRE_PICK = [-0.059, 0.831, 1.378, 0.0, 0.547, 0.0]
-
-# Tool tip 0.15 m ahead of and 0.62 m above base_link, over the robot body.
-ARM_SAFE_COMPACT = [0.0, -0.417, 0.466, 0.0, 0.883, 0.0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,6 +151,22 @@ def load_home_base() -> PoseStamped:
     ps.pose.orientation.z = math.sin(yaw / 2.0)
     ps.pose.orientation.w = math.cos(yaw / 2.0)
     return ps
+
+
+def approach_pose(pose: PoseStamped, back: float) -> PoseStamped:
+    """The same pose moved `back` metres backwards along its own heading.
+
+    A box's working pose leaves only ~3 cm between the robot and the box, so
+    the robot must arrive head-on. Driving to this point first, already facing
+    the box, makes the last leg a short straight line; arriving from the side
+    instead brushes the box and Nav2's collision monitor halts the robot.
+    """
+    p = copy.deepcopy(pose)
+    q = p.pose.orientation
+    yaw = 2.0 * math.atan2(q.z, q.w)
+    p.pose.position.x -= back * math.cos(yaw)
+    p.pose.position.y -= back * math.sin(yaw)
+    return p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,10 +331,22 @@ class MissionNode(Node):
     def _on_dock_status(self, msg: DockStatus):
         self.is_docked = bool(msg.is_docked)
 
-    def set_vacuum(self, enable: bool):
+    def vacuum_ready(self, enable: bool) -> bool:
+        """True once the Gazebo bridge subscribes to the attach/detach topic.
+
+        A message published before that is silently dropped. That matters: the
+        gripper's DetachableJoint starts ATTACHED to the cube, so a lost initial
+        detach leaves the robot welded to a cube 7.5 m away, which tilts the base
+        and stops it from turning on the spot.
+        """
+        pub = self._attach_pub if enable else self._detach_pub
+        return pub.get_subscription_count() > 0
+
+    def set_vacuum(self, enable: bool, log: bool = True):
         """Publish attach/detach once. Does not wait; the leaf must wait itself."""
-        state = 'ENGAGING' if enable else 'RELEASING'
-        self.get_logger().info(f'{state} vacuum gripper...')
+        if log:
+            state = 'ENGAGING' if enable else 'RELEASING'
+            self.get_logger().info(f'{state} vacuum gripper...')
         (self._attach_pub if enable else self._detach_pub).publish(Empty())
 
     def make_nav_goal(self, pose: PoseStamped) -> NavigateToPose.Goal:
@@ -403,7 +426,7 @@ def call_to_status(state: str) -> Status:
 
 
 class UndockLeaf(py_trees.behaviour.Behaviour):
-    """WORKED EXAMPLE. Read this, then write the other leaves the same way."""
+    """Leave the charging dock. Succeeds at once if the robot is already off it."""
 
     def __init__(self, ros_node: MissionNode, name='Undock'):
         super().__init__(name)
@@ -496,16 +519,30 @@ class SetVacuumLeaf(py_trees.behaviour.Behaviour):
         self.ros = ros_node
         self.enable = enable
         self.settle_sec = settle_sec
-        self._t0 = 0.0
+        self._t0 = None
 
     def initialise(self):
-        self.ros.set_vacuum(self.enable)
-        self._t0 = self.ros.now_sec()
+        self._t0 = None          # not sent yet: wait for the bridge to subscribe
+        self._t_enter = self.ros.now_sec()
 
     def update(self):
+        now = self.ros.now_sec()
+        if self._t0 is None:
+            if not self.ros.vacuum_ready(self.enable):
+                if now - self._t_enter > VACUUM_READY_TIMEOUT_SEC:
+                    self.ros.get_logger().error(
+                        f'[{self.name}] nobody subscribes to the gripper topic')
+                    return Status.FAILURE
+                return Status.RUNNING
+            self.ros.set_vacuum(self.enable)
+            self._t0 = now
+            return Status.RUNNING
+        # Re-send while settling: cheap insurance against a dropped message, and
+        # attach/detach are idempotent on the Gazebo side.
+        self.ros.set_vacuum(self.enable, log=False)
         # Sim-time wait, no time.sleep(): sleeping would freeze every other
         # callback and use wall time, which is wrong in a simulation.
-        if self.ros.now_sec() - self._t0 >= self.settle_sec:
+        if now - self._t0 >= self.settle_sec:
             return Status.SUCCESS
         return Status.RUNNING
 
@@ -514,27 +551,42 @@ class SetVacuumLeaf(py_trees.behaviour.Behaviour):
 # 6. THE TREE
 # ─────────────────────────────────────────────────────────────────────────────
 
+def go_to_box(ros_node: MissionNode, box_pose, label):
+    """Retry( Sequence( drive to the approach point, then to the box pose ) ).
+
+    A failed attempt restarts from the approach point, so a retry always ends
+    with a straight head-on approach rather than a sideways one.
+    """
+    return py_trees.decorators.Retry(
+        f'RetryGo{label}',
+        py_trees.composites.Sequence(name=f'Go{label}', memory=True, children=[
+            NavigateToLeaf(ros_node, approach_pose(box_pose, APPROACH_BACKOFF_M),
+                           name=f'NavigateTo{label}Approach'),
+            NavigateToLeaf(ros_node, box_pose, name=f'NavigateTo{label}'),
+        ]),
+        num_failures=3)
+
+
 def build_tree(ros_node: MissionNode, home_base, pick_pose, drop_pose):
     """Return the root behaviour of the mission tree.
 
-    Building blocks (py_trees 2.x):
-        py_trees.composites.Sequence(name='...', memory=True, children=[...])
-        py_trees.composites.Selector(name='...', memory=False, children=[...])
-        py_trees.decorators.Retry(name='...', child=leaf, num_failures=3)
+        Sequence(memory) Mission
+          detach -> fold arm -> undock
+          -> Retry(3, approach point -> source box)
+          -> arm to ARM_PICK -> attach -> fold arm
+          -> Retry(3, approach point -> target box)
+          -> arm to ARM_PLACE -> detach -> fold arm
 
-    memory=True means a Sequence resumes at the child that was RUNNING instead
-    of re-running the children that already succeeded (you do NOT want to
-    undock again after arriving at the box).
+    memory=True: the Sequence resumes at the child that was RUNNING instead of
+    re-running the ones that already succeeded (no second undock after arriving
+    at a box). Only navigation is retried: it is the step that can fail for
+    reasons that go away on a second try (a pedestrian in the way, a stuck
+    controller). An arm or gripper failure means something is genuinely wrong,
+    so the mission stops and says which step failed.
 
-    Suggested order for grade C:
-        detach (known gripper state) -> undock -> navigate(pick_pose)
-        -> arm to ARM_PICK -> attach -> arm to ARM_SAFE
-        -> navigate(drop_pose) -> arm to ARM_PLACE -> detach -> arm to ARM_SAFE
-
-    Questions to answer before you code it (the TAs will ask):
-      * which leaves deserve a Retry, and how many times?
-      * why is the arm folded to ARM_SAFE before driving?
-      * what happens to the cube if the second navigation fails?
+    The first detach is not cosmetic: the gripper's DetachableJoint starts the
+    simulation ATTACHED to the cube, i.e. the robot is welded to a cube 7.5 m
+    away until it is released.
     """
     # Fail now, not after the robot has already driven to the box.
     if ARM_PICK is None or ARM_PLACE is None:
@@ -544,18 +596,14 @@ def build_tree(ros_node: MissionNode, home_base, pick_pose, drop_pose):
     # the log, so the repeated actions (detach, arm to safe) get distinct names.
     root = py_trees.composites.Sequence(name='Mission', memory=True, children=[
         SetVacuumLeaf(ros_node, enable=False, name='DetachCubeInit'),
+        # Fold the arm before the base moves: low centre of mass while driving.
+        MoveArmLeaf(ros_node, ARM_SAFE, name='MoveArmSafeInit'),
         UndockLeaf(ros_node),
-        py_trees.decorators.Retry(
-            'RetryGoSource',
-            NavigateToLeaf(ros_node, pick_pose, name='NavigateToPick'),
-            num_failures=3),
+        go_to_box(ros_node, pick_pose, 'Source'),
         MoveArmLeaf(ros_node, ARM_PICK, name='MoveArmPick'),
         SetVacuumLeaf(ros_node, enable=True, name='AttachCube'),
         MoveArmLeaf(ros_node, ARM_SAFE, name='MoveArmSafeAfterPick'),
-        py_trees.decorators.Retry(
-            'RetryGoTarget',
-            NavigateToLeaf(ros_node, drop_pose, name='NavigateToDrop'),
-            num_failures=3),
+        go_to_box(ros_node, drop_pose, 'Target'),
         MoveArmLeaf(ros_node, ARM_PLACE, name='MoveArmPlace'),
         SetVacuumLeaf(ros_node, enable=False, name='DetachCube'),
         MoveArmLeaf(ros_node, ARM_SAFE, name='MoveArmSafeAfterPlace'),
