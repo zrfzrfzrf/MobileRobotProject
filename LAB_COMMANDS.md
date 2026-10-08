@@ -110,3 +110,49 @@ cd src/Warehouse_robot/warehouse_inventory_robot && python -m pytest test/test_m
 | 任务节点停在 `Starting mission.` 不动 | 仿真没起来或已经挂掉（没有 `/clock`）。检查终端 1，必要时清理后重启 |
 | 某一步变成失败、任务结束 | 记下终端 2 最后打印的那棵树，看是哪一步失败 |
 | 登录卡住或图形界面卡死 | 多半是磁盘配额满了，用 `fs quota` 检查，清理 `~/.cache` |
+
+## 七、使用队友的代码（A 级，分支 `teammate-grade-a`）
+
+队友的 `mission_node.py` 和 `mission.launch.py` 放在单独的分支 `teammate-grade-a` 上。
+两套代码的包名和可执行文件名相同，不能同时编译，所以通过切换分支来选用，
+`main` 分支保持我们自己的 C 级版本。
+
+切换到队友的代码并重新编译任务包：
+
+```bash
+git fetch && git checkout teammate-grade-a && colcon build --base-paths src/Warehouse_robot --packages-select warehouse_inventory_robot
+```
+
+切回我们自己的版本：
+
+```bash
+git checkout main && colcon build --base-paths src/Warehouse_robot --packages-select warehouse_inventory_robot
+```
+
+切换后都要重新 `source install/setup.bash`。
+
+### 用队友的代码跑 A 级
+
+**必须用 `GRADE=a` 这种环境变量写法**：他的启动文件靠环境变量 `GRADE`
+来决定里程计话题，只写 `grade:=a` 不够。
+
+终端 1：
+
+```bash
+GRADE=a ros2 launch warehouse_inventory_robot mission.launch.py
+```
+
+等日志里出现 `Managed nodes are active`（他用的是 Nav2 自带的生命周期管理器）。
+然后在 RViz 里选 **Publish Point** 工具，在地图上点一个位置，把机器人传送过去
+（这一步模拟 TA 的操作，要在启动任务节点之前做；不要用 2D Pose Estimate）。
+
+终端 2：
+
+```bash
+GRADE=a ros2 run warehouse_inventory_robot mission_node --ros-args -p use_sim_time:=true
+```
+
+任务节点启动后会先等约 20 秒再开始（他代码里的固定等待），这是正常的。
+之后会做全局定位：撒满粒子、原地转、必要时往前开一段，直到 AMCL 收敛。
+
+在这个分支上，第五节的逻辑测试不适用（测试是针对我们版本的代码写的）。
