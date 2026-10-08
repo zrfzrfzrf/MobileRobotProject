@@ -1,8 +1,7 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
-                            RegisterEventHandler)
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.conditions import IfCondition, UnlessCondition
@@ -10,32 +9,10 @@ from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJ
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
-
-
-def lifecycle_activator(name, nodes):
-    """Bring lifecycle nodes to `active`, one by one, retrying until they get there.
-
-    Stands in for nav2_lifecycle_manager, which gives each change_state call a
-    hardcoded deadline: on a loaded machine (Gazebo loading meshes, software
-    rendering) a node's reply misses it ("failed to send response to
-    /<node>/change_state"), the manager gives up, and the node stays
-    `unconfigured`/`inactive` for good -- no /map, or no navigation at all.
-    `ros2 lifecycle set` waits as long as it takes, and the loop re-checks the
-    real state, so a transition that was only slow is not mistaken for a failure.
-    """
-    script = (
-        'for n in ' + ' '.join(nodes) + '; do ok=0; '
-        'for i in $(seq 1 90); do '
-        'st=$(ros2 lifecycle get /$n 2>/dev/null); '
-        'case "$st" in '
-        'active*) ok=1; break;; '
-        'unconfigured*) ros2 lifecycle set /$n configure >/dev/null 2>&1;; '
-        'inactive*) ros2 lifecycle set /$n activate >/dev/null 2>&1;; '
-        'esac; sleep 2; done; '
-        'if [ $ok = 1 ]; then echo "$n: active"; '
-        'else echo "$n never became active" >&2; exit 1; fi; done')
-    return ExecuteProcess(cmd=['bash', '-c', script], name=name, output='screen')
-
+from nav2_common.launch import RewrittenYaml
+import yaml
+import tempfile
+from launch.actions import TimerAction
 
 def generate_launch_description():
     pkg_share = get_package_share_directory('warehouse_inventory_robot')
@@ -137,8 +114,47 @@ def generate_launch_description():
                    '--timeout', '300'],
     )
 
-    # Map server. Serves /map to Nav2's static costmap layer. It is a lifecycle
-    # node, so a lifecycle manager has to configure and activate it.
+    # TODO: Navigation Layer
+
+    nav2_params_file = build_nav2_params()
+
+    navigation = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('nav2_bringup'),
+                        'launch', 'navigation_launch.py')),
+        launch_arguments={
+            'use_sim_time': 'true',
+            'params_file': nav2_params_file,
+        }.items(),
+    )
+    # TODO: AMCL. For A grade only. The other grades get map -> odom from the static publisher
+    # above, which is exact. Remember to launch amcl only for A grade.
+
+    amcl = Node(
+        package='nav2_amcl',
+        executable='amcl',
+        name='amcl',
+        output='screen',
+        parameters=[nav2_params_file, {
+            'use_sim_time': True,
+            'set_initial_pose': True,
+            'initial_pose': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0},
+        }],
+        condition=IfCondition(grade_is_a),
+    )
+
+    amcl_life = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='amcl_lifecycle_manager',
+        output='screen',
+        parameters=[{'use_sim_time': True, 'autostart': True, 'node_names': ['amcl']}],
+        condition=IfCondition(grade_is_a),
+    )
+
+
+    # TODO: Map server.
+    # NOTE: We provide a map at src/Warehouse_robot/warehouse_inventory_robot/maps
     map_server = Node(
         package='nav2_map_server',
         executable='map_server',
@@ -146,39 +162,9 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'yaml_filename': os.path.join(pkg_share, 'maps', 'warehouse.yaml'),
-            'use_sim_time': True,
-        }],
+            'use_sim_time': True
+            }]
     )
-    map_lifecycle_manager = lifecycle_activator('activate_map_server', ['map_server'])
-
-    # Navigation layer: nav2_bringup's navigation_launch.py (planner, controller,
-    # behaviors, bt_navigator, ...). The parameter file is our copy in
-    # config/nav2_params.yaml (Pure Pursuit instead of MPPI), so tune it there.
-    #
-    # autostart is off: its lifecycle manager is the component that fails on a
-    # loaded machine (see lifecycle_activator), and its 4 s heartbeat deadline is
-    # too tight for a simulation running below real time -- the first planning
-    # request starved collision_monitor's heartbeat and the manager shut the whole
-    # stack down ("CRITICAL FAILURE: SERVER collision_monitor IS DOWN").
-    nav2 = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(
-            get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')),
-        launch_arguments={
-            'use_sim_time': 'true',
-            'params_file': os.path.join(pkg_share, 'config', 'nav2_params.yaml'),
-            'use_composition': 'False',
-            'autostart': 'false',
-        }.items(),
-    )
-    # Same node list as navigation_launch.py (Jazzy), in startup order.
-    nav2_lifecycle_manager = lifecycle_activator('activate_nav2', [
-        'controller_server', 'smoother_server', 'planner_server', 'route_server',
-        'behavior_server', 'velocity_smoother', 'collision_monitor', 'bt_navigator',
-        'waypoint_follower', 'docking_server'])
-
-    # TODO: AMCL. For A grade only. The other grades get map -> odom from the static publisher
-    # above, which is exact. Remember to launch amcl only for A grade.
-
     # TODO: You might also want to wait for map server and/or amcl to be ready.
     #
     # A fixed delay is fine for ordering things. It cannot fix one failure you
@@ -193,7 +179,22 @@ def generate_launch_description():
     #
     #     ros2 lifecycle get /map_server
     #     ros2 lifecycle set /map_server activate
+    map_life = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='map_lifecycle_manager',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'autostart': True,
+            'node_names': ['map_server'],
+        }],
+    )
 
+    delayed_arm_spawner = TimerAction(
+        period=10.0,
+        actions=[arm_traj_spawner]
+    )
     return LaunchDescription([
         grade_arg, x_pose_arg, y_pose_arg, headless_arg,
 
@@ -204,17 +205,90 @@ def generate_launch_description():
         # Start watching for the simulation to come up.
         wait_for_sim,
 
+        map_server,
+        map_life,
+
+        amcl,
+        amcl_life,
         RegisterEventHandler(
             event_handler=OnProcessExit(
                 target_action=wait_for_sim,
                 on_exit=[
-                    arm_traj_spawner,
+                    delayed_arm_spawner,
                     static_map_to_odom,
-                    map_server,
-                    map_lifecycle_manager,
-                    nav2,
-                    nav2_lifecycle_manager,
+                    navigation,
                 ],
             )
         ),
     ])
+
+def build_nav2_params():
+    src = os.path.join(get_package_share_directory('nav2_bringup'),
+                       'params', 'nav2_params.yaml')
+    with open(src) as f:
+        params = yaml.safe_load(f)
+
+    odom = '/odom' if os.environ.get('GRADE', 'e').lower() == 'a' else '/odom_gt'
+    # pure pursuit
+    params['controller_server']['ros__parameters']['FollowPath'] = {
+        'plugin': 'nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController',
+        'desired_linear_vel': 0.3,
+        'lookahead_dist': 0.6,
+        'min_lookahead_dist': 0.3,
+        'max_lookahead_dist': 0.9,
+        'use_velocity_scaled_lookahead_dist': True,
+        'use_rotate_to_heading': True,
+        'rotate_to_heading_angular_vel': 1.0,
+        'allow_reversing': False,
+        'use_collision_detection': True,
+    }
+
+    params['controller_server']['ros__parameters']['progress_checker'] = {
+        'plugin': 'nav2_controller::SimpleProgressChecker',
+        'required_movement_radius': 0.1,
+        'movement_time_allowance': 40.0,
+    }
+
+    params['controller_server']['ros__parameters']['general_goal_checker'] = {
+        'plugin': 'nav2_controller::SimpleGoalChecker',
+        'xy_goal_tolerance': 0.05,
+        'yaw_goal_tolerance': 0.05,
+        'stateful': True,
+    }
+
+    params['controller_server']['ros__parameters']['controller_frequency'] = 10.0
+
+    params['local_costmap']['local_costmap']['ros__parameters']['update_frequency'] = 5.0
+    params['local_costmap']['local_costmap']['ros__parameters']['publish_frequency'] = 2.0
+    params['global_costmap']['global_costmap']['ros__parameters']['update_frequency'] = 1.0
+    params['global_costmap']['global_costmap']['ros__parameters']['publish_frequency'] = 1.0
+
+    # params['bt_navigator']['ros__parameters']['odom_topic'] = '/odom_gt'
+    # params['velocity_smoother']['ros__parameters']['odom_topic'] = '/odom_gt'
+    # params['controller_server']['ros__parameters']['odom_topic'] = '/odom_gt'
+    
+    # use unstamped
+    params['collision_monitor']['ros__parameters']['cmd_vel_out_topic'] = 'cmd_vel_unstamped'
+
+    amcl = params['amcl']['ros__parameters']
+    amcl['min_particles'] = 5000
+    amcl['max_particles'] = 20000
+    amcl['update_min_a'] = 0.1
+    amcl['update_min_d'] = 0.1
+    amcl['recovery_alpha_slow'] = 0.001
+    amcl['recovery_alpha_fast'] = 0.1
+
+
+    params['bt_navigator']['ros__parameters']['odom_topic'] = odom
+    params['velocity_smoother']['ros__parameters']['odom_topic'] = odom
+    params['controller_server']['ros__parameters']['odom_topic'] = odom
+
+    vs = params['velocity_smoother']['ros__parameters']
+    vs['max_velocity'] = [0.6, 0.0, 0.6]
+    vs['min_velocity'] = [-0.6, 0.0, -0.6]
+    vs['max_accel']    = [0.1, 0.0, 0.4]
+    vs['max_decel']    = [-0.1, 0.0, -0.4]
+    tmp = tempfile.NamedTemporaryFile('w', suffix='_nav2_params.yaml', delete=False)
+    yaml.safe_dump(params, tmp)
+    tmp.close()
+    return tmp.name

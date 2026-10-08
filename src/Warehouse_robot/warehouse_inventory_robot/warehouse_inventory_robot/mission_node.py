@@ -1,54 +1,57 @@
 """
-mission_node.py — Student entry point (grade C: behaviour tree).
-
-Layout of this file
-  1. constants            where to go, which arm poses
-  2. loaders              shelves.yaml -> PoseStamped, approach points
-  3. AsyncActionCall      non-blocking action wrapper
-  4. MissionNode          ROS clients / publishers / tick loop
-  5. behaviour leaves     undock, navigate, move arm, vacuum
-  6. build_tree()         the mission as a behaviour tree
-  7. main()
-
-Rule of thumb for a BT: update() is called on every tick (10 Hz) and must
-return immediately. Never call time.sleep() or spin_until_future_complete()
-inside a leaf; start the work in initialise(), poll it in update(), and
-return RUNNING until it finishes.
+mission_node.py — Student entry point.
 """
 
 import os
-import copy
-import math
-from pathlib import Path
-
-import yaml
 import rclpy
+import time
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from rclpy.qos import qos_profile_sensor_data
 
-import py_trees
-from py_trees.common import Status
+import yaml
+import math
+from pathlib import Path
+from geometry_msgs.msg import PoseStamped
+
+from geometry_msgs.msg import Twist, TwistStamped
+from ament_index_python.packages import get_package_share_directory
+from irobot_create_msgs.action import Undock
+from std_msgs.msg import Empty
+
+from control_msgs.action import FollowJointTrajectory
+from trajectory_msgs.msg import JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
+
 
 from action_msgs.msg import GoalStatus
-from ament_index_python.packages import get_package_share_directory
-from builtin_interfaces.msg import Duration
-from control_msgs.action import FollowJointTrajectory
-from geometry_msgs.msg import PoseStamped
-from irobot_create_msgs.action import Undock
-from irobot_create_msgs.msg import DockStatus
 from nav2_msgs.action import NavigateToPose
-from std_msgs.msg import Empty
-from trajectory_msgs.msg import JointTrajectoryPoint
 
+# our imports
+import py_trees
+from py_trees.common import Status
+from nav2_msgs.action import Spin
+from std_srvs.srv import Empty as EmptyServer
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from py_trees.decorators import FailureIsSuccess
+from nav2_msgs.action import DriveOnHeading, BackUp
+from geometry_msgs.msg import Point
+import traceback
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. CONSTANTS
+# WHERE THE MISSION GOES, PER GRADE
 #
-# The grade comes from a ROS parameter / the GRADE environment variable, so it
-# cannot silently disagree with the grade the simulation was launched with:
+# Every grade collects the cube from the same source box. They differ only in
+# which box it is placed on, and config/shelves.yaml holds all of them.
 #
-#     GRADE=c pixi run mission            # world, odometry, nav stack
+# The grade comes from a ROS parameter rather than being written in here, so it
+# cannot silently disagree with the grade the simulation was launched with. Set
+# both from one place:
+#
+#     GRADE=c pixi run mission            # world, odometry, localization
 #     GRADE=c pixi run mission-node       # this node
+#
+# MissionNode logs the grade it is running as, so a mismatch is visible in the
+# first line of output rather than showing up as the robot driving to the wrong
+# box twenty metres away.
 # ─────────────────────────────────────────────────────────────────────────────
 
 SOURCE_BOX = 'shelf_7_ID11'
@@ -59,43 +62,11 @@ DROP_BOX_BY_GRADE = {
     'a': 'shelf_7_ID20',   # target-2, same as C
 }
 
-TICK_PERIOD_SEC = 0.1          # the BT is ticked at 10 Hz (simulated time)
-UNDOCK_TIMEOUT_SEC = 60.0      # all timeouts below are measured in SIM time
-NAV_TIMEOUT_SEC = 400.0
-ARM_TIMEOUT_SEC = 60.0
-VACUUM_SETTLE_SEC = 1.5        # wait after attach/detach so the cube settles
-VACUUM_READY_TIMEOUT_SEC = 30.0  # give up if the gripper bridge never subscribes
-APPROACH_BACKOFF_M = 0.5       # approach point this far behind each box pose
+ARM_SAFE = [0.0, -0.5, 0.2, 0.0, 0.0, 0.0] 
+ARM_PICK = [0.0, 1.4, 1.85, 0.0, 0.0, 0.0]
+ARM_PLACE = [0.0, 1.8, 2.5, 0.0, 0.0, 0.0]
 
-ARM_JOINT_NAMES = [
-    'arm_joint1', 'arm_joint2', 'arm_joint3',
-    'arm_joint4', 'arm_joint5', 'arm_joint6',
-]
-
-# Joint angles in radians, in the order of ARM_JOINT_NAMES.
-#
-# All poses come from inverse kinematics on the URDF (tool pointing straight down,
-# joint 6 left at 0) and were checked in the simulator: the tool tip (TF frame
-# arm_link_tcp) lands within 1 mm of the intended point.
-#
-# ARM_SAFE: tool tip 0.15 m ahead of and 0.62 m above base_link, over the robot
-# body, which keeps the centre of mass low and central while driving. The spawn
-# pose (config/initial_positions.yaml) holds the arm 0.46 m forward, 0.73 m high.
-ARM_SAFE = [0.0, -0.417, 0.466, 0.0, 0.883, 0.0]
-
-# ARM_PICK: tool tip 0.34 m ahead of base_link and level with the cube top
-# (z = 0.38 m), i.e. on the cube when the robot stands on the source box pose.
-ARM_PICK = [-0.059, 1.274, 1.568, 0.0, 0.293, 0.0]
-# The cube hangs under the tool tip, so it lands where the tip is. The target box
-# (1.0 x 0.5 m) has its near edge only ~0.22 m ahead of the robot and its centre at
-# 0.47 m, which the arm cannot reach with the tool pointing down (limit ~0.43 m).
-# Tip at 0.40 m ahead, z = 0.39 m: ~15 cm inside the near edge.
-ARM_PLACE = [0.0, 1.498, 2.098, 0.0, 0.6, 0.0]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. LOADERS (given)
-# ─────────────────────────────────────────────────────────────────────────────
+COVARIANCE = 0.07
 
 def load_shelf(name: str) -> PoseStamped:
     for shelf in load_shelves():
@@ -134,7 +105,6 @@ def load_shelves(priority_first: bool = False) -> list[dict]:
 
     return shelves
 
-
 def load_home_base() -> PoseStamped:
     pkg_share = get_package_share_directory('warehouse_inventory_robot')
     yaml_path = Path(pkg_share) / 'config' / 'shelves.yaml'
@@ -153,138 +123,374 @@ def load_home_base() -> PoseStamped:
     return ps
 
 
-def approach_pose(pose: PoseStamped, back: float) -> PoseStamped:
-    """The same pose moved `back` metres backwards along its own heading.
 
-    A box's working pose leaves only ~3 cm between the robot and the box, so
-    the robot must arrive head-on. Driving to this point first, already facing
-    the box, makes the last leg a short straight line; arriving from the side
-    instead brushes the box and Nav2's collision monitor halts the robot.
-    """
-    p = copy.deepcopy(pose)
-    q = p.pose.orientation
-    yaw = 2.0 * math.atan2(q.z, q.w)
-    p.pose.position.x -= back * math.cos(yaw)
-    p.pose.position.y -= back * math.sin(yaw)
-    return p
+class ActionLeaf(py_trees.behaviour.Behaviour):
+    def __init__(self, name, node, client, timeout=360.0):
+        super().__init__(name)
+        self.node = node
+        self.client = client
+        self.timeout = timeout
 
+    def make_goal(self):
+        raise NotImplementedError
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. NON-BLOCKING ACTION CALL (given)
-#
-# ROS actions are asynchronous: you send a goal, the server accepts it, works
-# for a while, then returns a result. A BT leaf can't block for that, so this
-# small state machine hides the plumbing:
-#
-#     start(goal)  ->  WAITING  (server not up yet; retried on every poll)
-#                  ->  SENDING  (goal sent, waiting for accept/reject)
-#                  ->  ACTIVE   (accepted, waiting for the result)
-#                  ->  SUCCEEDED | FAILED
-#
-# Call poll() once per tick; it never blocks. A call that takes longer than
-# timeout_sec of sim time is cancelled and reported as FAILED.
-# ─────────────────────────────────────────────────────────────────────────────
+    def initialise(self):
+        self.goal_future = None
+        self.result_future = None
+        self.handle = None
+        self.t = time.time()
+        self.node.get_logger().info(f'[BT] start: {self.name}')
 
-class AsyncActionCall:
-    IDLE = 'IDLE'
-    WAITING = 'WAITING'
-    SENDING = 'SENDING'
-    ACTIVE = 'ACTIVE'
-    SUCCEEDED = 'SUCCEEDED'
-    FAILED = 'FAILED'
+    def update(self):
+        if time.time() > self.t + self.timeout:
+            self.node.get_logger().error(f'{self.name} timed out !!')
+            if self.handle is not None:
+                self.handle.cancel_goal_async()
+            return Status.FAILURE
 
-    def __init__(self, ros_node, client, label, timeout_sec):
-        self._ros = ros_node
-        self._client = client
-        self._label = label
-        self._timeout = timeout_sec
-        self.state = self.IDLE
-        self.result = None          # the action's Result message, once finished
-        self._goal = None
-        self._goal_future = None
-        self._handle = None
-        self._result_future = None
-        self._t0 = 0.0
+        if self.goal_future is None:
+            if self.client.server_is_ready():
+                self.goal_future = self.client.send_goal_async(self.make_goal())
+            return Status.RUNNING
 
-    def start(self, goal):
-        self.cancel()
-        self._goal = goal
-        self.result = None
-        self._goal_future = None
-        self._handle = None
-        self._result_future = None
-        self._t0 = self._ros.now_sec()
-        self.state = self.WAITING
+        if self.result_future is None:
+            if not self.goal_future.done():
+                return Status.RUNNING
+            
+            self.handle = self.goal_future.result()
 
-    def poll(self) -> str:
-        if self.state in (self.WAITING, self.SENDING, self.ACTIVE):
-            if self._ros.now_sec() - self._t0 > self._timeout:
-                self._ros.get_logger().error(
-                    f'[{self._label}] timed out after {self._timeout:.0f}s (sim time)')
-                self.cancel()
-                self.state = self.FAILED
-                return self.state
+            if not self.handle.accepted:
+                self.node.get_logger().error(f'{self.name} goal rejected!')
+                return Status.FAILURE
+            self.result_future = self.handle.get_result_async()
+            return Status.RUNNING
 
-        if self.state == self.WAITING and self._client.server_is_ready():
-            self._goal_future = self._client.send_goal_async(self._goal)
-            self.state = self.SENDING
+        if not self.result_future.done():
+            return Status.RUNNING
 
-        if self.state == self.SENDING and self._goal_future.done():
-            self._handle = self._goal_future.result()
-            if not self._handle.accepted:
-                self._ros.get_logger().error(f'[{self._label}] goal rejected')
-                self.state = self.FAILED
-            else:
-                self._result_future = self._handle.get_result_async()
-                self.state = self.ACTIVE
+        result = self.result_future.result()
+        if result.status != GoalStatus.STATUS_SUCCEEDED:
+            self.node.get_logger().error(f'{self.name}: status {result.status}')
+            return Status.FAILURE
 
-        if self.state == self.ACTIVE and self._result_future.done():
-            wrapped = self._result_future.result()
-            self.result = wrapped.result
-            if wrapped.status == GoalStatus.STATUS_SUCCEEDED:
-                self.state = self.SUCCEEDED
-            else:
-                self._ros.get_logger().warn(
-                    f'[{self._label}] finished with action status {wrapped.status}')
-                self.state = self.FAILED
+        self.node.get_logger().info(
+            f'[BT] done: {self.name} ({time.time() - self.t:.1f}s)')
+        return Status.SUCCESS
 
-        return self.state
+    def terminate(self, status):
+        if status == Status.INVALID and self.handle is not None:
+            self.handle.cancel_goal_async()
 
-    def cancel(self):
-        """Abort an in-flight call. Safe to call in any state."""
-        if self.state == self.SENDING and self._goal_future is not None:
-            def _cancel_when_accepted(fut):
-                handle = fut.result()
-                if handle.accepted:
-                    handle.cancel_goal_async()
-            self._goal_future.add_done_callback(_cancel_when_accepted)
-            self.state = self.IDLE
-        elif self.state == self.ACTIVE and self._handle is not None:
-            self._handle.cancel_goal_async()
-            self.state = self.IDLE
-        elif self.state == self.WAITING:
-            self.state = self.IDLE
+class UndockLeaf(ActionLeaf):
+    def make_goal(self):
+        return Undock.Goal()
+    
 
-    @property
-    def in_flight(self) -> bool:
-        return self.state in (self.WAITING, self.SENDING, self.ACTIVE)
+class NavigateTo(ActionLeaf):
+    def __init__(self, name, node, pose):
+        super().__init__(name, node, node._nav_client, timeout=1000.0)
+        self.pose = pose
+
+    def make_goal(self):
+        goal = NavigateToPose.Goal()
+        self.pose.header.stamp = self.node.get_clock().now().to_msg()
+        goal.pose = self.pose
+        return goal
+
+class MoveArm(ActionLeaf):
+    def __init__(self, name, node, angles, duration=5):
+        super().__init__(name, node, node._arm_client, timeout=180.0)
+        self.angles = angles
+        self.duration = duration
+
+    def make_goal(self):
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = [f'arm_joint{i}' for i in range(1, 7)]
+        point = JointTrajectoryPoint()
+        point.positions = self.angles
+        point.time_from_start = Duration(sec=self.duration)
+        goal.trajectory.points.append(point)
+        return goal
+
+class Vacuum(py_trees.behaviour.Behaviour):
+    def __init__(self, name, node, enable):
+        super().__init__(name)
+        self.node = node
+        self.enable = enable
+
+    def initialise(self):
+        if self.enable:
+            self.node._attach_pub.publish(Empty())
+        else:
+            self.node._detach_pub.publish(Empty())
+        self.t = time.time()
+
+    def update(self):
+        if time.time() > self.t + 2.0:
+            return Status.SUCCESS
+        return Status.RUNNING
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. THE ROS NODE (given)
-#
-# Owns every ROS client / publisher / subscriber and the tick loop. Leaves
-# reach the robot only through this object (they hold it as self.ros).
-# ─────────────────────────────────────────────────────────────────────────────
+class SpinLeaf(ActionLeaf):
+    def __init__(self, name, node, yaw=3.0):
+        super().__init__(name, node, node._spin_client, timeout=120.0)
+        self.yaw = yaw
+
+    def make_goal(self):
+        goal = Spin.Goal()
+        goal.target_yaw = self.yaw
+        return goal
+
+
+class Rescatter(py_trees.behaviour.Behaviour):
+    def __init__(self, name, node):
+        super().__init__(name)
+        self.node = node
+
+    def initialise(self):
+        self.future = None
+
+    def update(self):
+        if self.future is None:
+            if not self.node._rescatter_client.service_is_ready():
+                return Status.RUNNING
+            self.future = self.node._rescatter_client.call_async(EmptyServer.Request())
+            return Status.RUNNING
+        return Status.SUCCESS if self.future.done() else Status.RUNNING
+
+
+class Check(py_trees.behaviour.Behaviour):
+    def __init__(self, name, node, key, warn=False):
+        super().__init__(name)
+        self.node, self.key, self.warn = node, key, warn
+
+    def update(self):
+        ok = self.node.state[self.key]
+        if not ok and self.warn:
+            self.node.get_logger().warn(
+                f'{self.name} FAILED, cov = {self.node.last_cov}')  
+        return Status.SUCCESS if ok else Status.FAILURE
+    
+class SetFlag(py_trees.behaviour.Behaviour):
+    def __init__(self, name, node, **flags):
+        super().__init__(name)
+        self.node, self.flags = node, flags
+
+    def update(self):
+        self.node.state.update(self.flags)
+        self.node.get_logger().info(
+            f'[BT] flags: {self.flags}')
+        return Status.SUCCESS
+
+# class DriveLeaf(ActionLeaf):
+#     def __init__(self, name, node, dist=3.0, speed=0.3):
+#         super().__init__(name, node, node._drive_client, timeout=60.0)
+#         self.dist, self.speed = dist, speed
+
+#     def make_goal(self):
+#         goal = DriveOnHeading.Goal()
+#         goal.target = Point(x=self.dist, y=0.0, z=0.0)
+#         goal.speed = self.speed
+#         goal.time_allowance = Duration(sec=10)
+#         return goal
+    
+# class BackupLeaf(ActionLeaf):
+#     def __init__(self, name, node, dist=2.6, speed=0.15):
+#         super().__init__(name, node, node._backup_client, timeout=40.0)
+#         self.dist, self.speed = dist, speed
+
+#     def make_goal(self):
+#         goal = BackUp.Goal()
+#         goal.target = Point(x=self.dist, y=0.0, z=0.0)
+#         goal.speed = self.speed
+#         goal.time_allowance = Duration(sec=10)
+#         return goal
+
+class DriveLeaf(ActionLeaf):
+    def __init__(self, name, node, dist=1.0, speed=0.2):
+        super().__init__(name, node, node._drive_client, timeout=40.0)
+        self.dist, self.speed = dist, speed
+
+    def make_goal(self):
+        goal = DriveOnHeading.Goal()
+        goal.target = Point(x=self.dist, y=0.0, z=0.0)
+        goal.speed = self.speed
+        goal.time_allowance = Duration(sec=20)
+        return goal
+
+
+class BackupLeaf(ActionLeaf):
+    def __init__(self, name, node, dist=1.0, speed=0.2):
+        super().__init__(name, node, node._backup_client, timeout=40.0)
+        self.dist, self.speed = dist, speed
+
+    def make_goal(self):
+        goal = BackUp.Goal()
+        goal.target = Point(x=self.dist, y=0.0, z=0.0)
+        goal.speed = self.speed
+        goal.time_allowance = Duration(sec=20)
+        return goal
+    
+# def move_a_bit(node, name):
+#     return FailureIsSuccess(name=f'{name} move', child=sel(f'{name} drive or back', [
+#         DriveLeaf(f'{name} drive', node),
+#         BackupLeaf(f'{name} backup', node),
+#     ], memory=True))
+
+def move_a_bit(node, name):
+    return FailureIsSuccess(name=f'{name} move',
+                            child=DriveLeaf(f'{name} drive', node, dist=2.0))
+
+def seq(name, children, memory=True):
+    return py_trees.composites.Sequence(name=name, memory=memory, children=children)
+
+
+def sel(name, children, memory=False):
+    return py_trees.composites.Selector(name=name, memory=memory, children=children)
+
+
+def ensure(node, key, action):
+    return sel(f'ensure {key}', [Check(f'{key}?', node, key), action])
+
+
+def undock(node):
+    return seq('undock', [
+        MoveArm('arm safe', node, ARM_SAFE),
+        UndockLeaf('undock', node, node._undock_client),
+        SetFlag('undocked!', node, undocked=True, arm_safe=False)])
+
+
+def arm_to(node, name, angles, safe):
+    return seq(name, [MoveArm(name, node, angles),
+                      SetFlag(f'{name} done', node, arm_safe=safe)])
+
+
+# def localize(node):
+#     return seq('localize', [
+#         Rescatter('global init', node),
+#         py_trees.decorators.Retry('retry spins',
+#             settle(node, 'localize', spins=6), num_failures=3),
+#         SetFlag('localized!', node, localized=True)])
+
+# def localize(node):
+#     return py_trees.decorators.Retry('retry localize', seq('localize', [
+#         Rescatter('global init', node),
+#         settle(node, 'localize', rounds=3),
+#         SetFlag('localized!', node, localized=True)]), num_failures=2)
+
+# def localize(node):
+#     return seq('localize', [
+#         Rescatter('global init', node),
+#         py_trees.decorators.Retry('retry settle',
+#             settle(node, 'localize', rounds=3), num_failures=3),
+#         SetFlag('localized!', node, localized=True)])
+
+def localize(node):
+    # fast check if not moved
+    verify = seq('verify pose', [
+        Check('converged?', node, 'converged'),
+        SpinLeaf('verify spin', node, yaw=3.0),
+        Check('still converged?', node, 'converged')])
+
+    # rescatter if not
+    full = seq('full localize', [
+        Rescatter('global init', node),
+        py_trees.decorators.Retry('retry settle',
+            settle(node, 'localize', rounds=3), num_failures=3)])
+
+    return seq('localize', [
+        sel('verify or relocalize', [verify, full], memory=True),
+        SetFlag('localized!', node, localized=True)])
+
+def move_to(node, name, pose, here, other, refine=False):
+    nav = [NavigateTo(name, node, pose)]
+    if refine:
+        nav += [NavigateTo(f'{name} refine', node, pose)]
+    nav.append(SetFlag(f'{name} arrived', node, **{here: True, other: False}))
+
+    preconditions = seq(f'{name} preconditions', [
+        ensure(node, 'undocked', undock(node)),
+        ensure(node, 'localized', localize(node)),
+        ensure(node, 'arm_safe', arm_to(node, 'arm up', ARM_SAFE, True)),
+        seq(f'{name} drive', nav),
+    ], memory=False)
+    return sel(f'{name}?', [Check(f'at {here}?', node, here), preconditions])
+
+# def settle(node, name, spins=4):
+#     steps = [FailureIsSuccess(name=f'{name} spin {i}', child=sel(
+#              f'{name} spin? {i}',
+#              [Check('converged?', node, 'converged'),
+#               seq(f'{name} spin+drive {i}', [
+#                 SpinLeaf(f'{name} spin {i}', node, yaw=1.5),
+#                 move_a_bit(node, f'{name} {i}')])],
+#              memory=True))
+#          for i in range(spins)]
+#     return seq(f'{name} settle',
+#                [SetFlag(f'{name} forget', node, converged=False)]
+#                + steps
+#                + [Check(f'{name} really converged?', node, 'converged', warn=True)])
+
+def spin_step(node, name, i):
+    return FailureIsSuccess(name=f'{name} spin {i}', child=sel(
+        f'{name} spin? {i}',
+        [Check('converged?', node, 'converged'),
+         SpinLeaf(f'{name} spin {i}', node, yaw=1.5)],
+        memory=True))
+
+
+
+def settle(node, name, rounds=3):
+    steps = [
+        sel(f'{name} round {i}', [
+            Check('converged?', node, 'converged'),
+            seq(f'{name} look and move {i}', [
+                FailureIsSuccess(name=f'{name} spin {i}',
+                    child=SpinLeaf(f'{name} spin {i}', node, yaw=3.0)),
+                sel(f'{name} done or move {i}', [
+                    Check('converged?', node, 'converged'),
+                    move_a_bit(node, f'{name} {i}')]),
+            ]),
+        ], memory=True)
+        for i in range(rounds)
+    ]
+    return seq(f'{name} settle',
+               [SetFlag(f'{name} forget', node, converged=False)]
+               + steps
+               + [Check(f'{name} really converged?', node, 'converged', warn=True)])
+
+
+def build_full_tree(node, pick_pose, drop_pose):
+    get_cube = sel('have cube?', [
+        Check('has_cube?', node, 'has_cube'),
+        seq('get cube', [
+            move_to(node, 'go to cube', pick_pose, 'at_source', 'at_target'),
+            arm_to(node, 'arm to pick', ARM_PICK, False),
+            Vacuum('grab', node, True),
+            arm_to(node, 'arm picked up', ARM_SAFE, True),
+            SetFlag('got cube', node, has_cube=True)])])
+
+    place_cube = sel('placed?', [
+        Check('placed?', node, 'placed'),
+        seq('place cube', [
+            move_to(node, 'go target', drop_pose, 'at_target', 'at_source', refine=True),
+            arm_to(node, 'arm place down', ARM_PLACE, False),
+            Vacuum('release', node, False),
+            arm_to(node, 'arm back up', ARM_SAFE, True),
+            SetFlag('cube placed', node, placed=True)])])
+
+    return seq('Mission', [get_cube, place_cube])
+
 
 class MissionNode(Node):
 
     def __init__(self):
         super().__init__('mission_node')
 
-        # Read from the GRADE environment variable, so one spelling works
-        # whether you go through `GRADE=c pixi run mission-node` or call
-        # ros2 run yourself inside a pixi shell. An explicit -p grade:=c wins.
+        # Which grade this run is for. Read from the GRADE environment
+        # variable, so one spelling works whether you go through
+        # `GRADE=c pixi run mission-node` or call ros2 run yourself inside a
+        # pixi shell. An explicit -p grade:=c overrides it. Use the same value
+        # you launched the simulation with.
         self.declare_parameter('grade', os.environ.get('GRADE', 'e'))
         self.grade = str(self.get_parameter('grade').value).strip().lower()
         if self.grade not in DROP_BOX_BY_GRADE:
@@ -300,320 +506,209 @@ class MissionNode(Node):
             f"Mission node started for grade '{self.grade}'. "
             f'Collect from {self.source_box}, place on {self.drop_box}.')
 
-        # Actuators / interfaces -------------------------------------------
         self._attach_pub = self.create_publisher(Empty, '/vacuum_gripper/attach', 10)
         self._detach_pub = self.create_publisher(Empty, '/vacuum_gripper/detach', 10)
-        self.undock_client = ActionClient(self, Undock, '/undock')
-        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
-        self.arm_client = ActionClient(
-            self, FollowJointTrajectory,
-            '/lite6_traj_controller/follow_joint_trajectory')
+        self._undock_client = ActionClient(self, Undock, '/undock')
+        self._arm_client = ActionClient(
+            self, 
+            FollowJointTrajectory, 
+            '/lite6_traj_controller/follow_joint_trajectory'
+        )
 
-        # True / False once the first /dock_status message arrives, None before.
-        # Handy as a BT condition ("is the robot undocked?").
-        self.is_docked = None
-        self.create_subscription(
-            DockStatus, 'dock_status', self._on_dock_status, qos_profile_sensor_data)
+        self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._spin_client = ActionClient(self, Spin, 'spin')
+        self._rescatter_client = self.create_client(EmptyServer, '/reinitialize_global_localization')
+        self.state = dict(undocked=False,
+                        localized=False,
+                        converged=False,
+                        arm_safe=False,
+                        at_source=False,
+                        at_target=False,
+                        has_cube=False,
+                        placed=False)
+        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self._amcl_cb, 10)
+        self.last_cov = None
+        self._drive_client = ActionClient(self, DriveOnHeading, 'drive_on_heading')
+        self._backup_client = ActionClient(self, BackUp, 'backup')
 
-        # BT bookkeeping -----------------------------------------------------
-        self.tree = None
-        self.done = False
-        self.success = False
-        self._last_snapshot = ''
-        self._timer = None
+    def undock_robot(self):
+        # TODO: Implement undocking logic using the Undock action client (self._undock_client).
+        #       Return True once the base is undocked, False if it refused.
 
-    # --- small helpers leaves use ------------------------------------------
+        if not self._undock_client.wait_for_server(timeout_sec=500.0):
+            self.get_logger().error('undock action server is not available')
+            return False
 
-    def now_sec(self) -> float:
-        """Current time in seconds on the node clock (sim time with use_sim_time)."""
-        return self.get_clock().now().nanoseconds / 1e9
+        send = self._undock_client.send_goal_async(Undock.Goal())
+        rclpy.spin_until_future_complete(self, send, timeout_sec=100.0)
+        if not send.done():
+            self.get_logger().error('undock goal not acknowledged')
+            return False
+        
+        acceptance = send.result()
+        if not acceptance.accepted:
+            self.get_logger().error('undock goal rejected')
+            return False
+        
+        future = acceptance.get_result_async()
+        rclpy.spin_until_future_complete(self, future, timeout_sec=300.0)
+        if not future.done():
+            self.get_logger().error('undock try timed out')
+            return False
 
-    def _on_dock_status(self, msg: DockStatus):
-        self.is_docked = bool(msg.is_docked)
+        result = future.result()
+        if result.status != GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().error(f'undock ended with bad status {result.status}')
+            return False
 
-    def vacuum_ready(self, enable: bool) -> bool:
-        """True once the Gazebo bridge subscribes to the attach/detach topic.
+        if result.result.is_docked:
+            self.get_logger().error('undocked but still docked (?)')
+            return False
+        
+        return True
+        # raise NotImplementedError('undock_robot() is yours to write')
 
-        A message published before that is silently dropped. That matters: the
-        gripper's DetachableJoint starts ATTACHED to the cube, so a lost initial
-        detach leaves the robot welded to a cube 7.5 m away, which tilts the base
-        and stops it from turning on the spot.
-        """
-        pub = self._attach_pub if enable else self._detach_pub
-        return pub.get_subscription_count() > 0
+    def go_to_pose(self, pose_stamped):
+        pose_stamped.header.stamp = self.get_clock().now().to_msg()
+        self.get_logger().info(f"Navigating to x: {pose_stamped.pose.position.x}, y: {pose_stamped.pose.position.y}")
+        # TODO: Implement navigation to the given pose using Nav2's NavigateToPose action.
+        #       Return True once the robot has arrived, False if it did not. Callers
+        #       read the return value as "did this work", so falling off the end and
+        #       returning None counts as failure.
 
-    def set_vacuum(self, enable: bool, log: bool = True):
-        """Publish attach/detach once. Does not wait; the leaf must wait itself."""
-        if log:
-            state = 'ENGAGING' if enable else 'RELEASING'
-            self.get_logger().info(f'{state} vacuum gripper...')
-        (self._attach_pub if enable else self._detach_pub).publish(Empty())
+        if not self._nav_client.wait_for_server(timeout_sec=50.0):
+            self.get_logger().error('navigation server not available')
+            return False
 
-    def make_nav_goal(self, pose: PoseStamped) -> NavigateToPose.Goal:
         goal = NavigateToPose.Goal()
-        goal.pose = pose
-        goal.pose.header.frame_id = 'map'
-        goal.pose.header.stamp = self.get_clock().now().to_msg()
-        return goal
+        goal.pose = pose_stamped
+        send = self._nav_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send, timeout_sec=50.0)
+        if not send.done():
+            self.get_logger().error('navigation goal not acknowledged')
+            return False
 
-    def make_arm_goal(self, angles, duration_sec=4) -> FollowJointTrajectory.Goal:
-        if angles is None:
-            raise ValueError('arm pose is None; fill in ARM_PICK / ARM_PLACE at the top')
-        if len(angles) != len(ARM_JOINT_NAMES):
-            raise ValueError(f'expected {len(ARM_JOINT_NAMES)} joint angles, got {len(angles)}')
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = list(ARM_JOINT_NAMES)
+        acceptance = send.result()
+        if not acceptance.accepted:
+            self.get_logger().error('navigation goal rejected')
+            return False
+
+        future = acceptance.get_result_async()
+        rclpy.spin_until_future_complete(self, future, timeout_sec=360.0)
+        if not future.done():
+            self.get_logger().error('navigation reached max time')
+            acceptance.cancel_goal_async()
+            return False
+
+        result = future.result()
+        if result.status != GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().error(f'navigation finished with status {result.status}')
+            return False
+        return True
+
+        
+
+    def toggle_vacuum(self, enable=True):
+        state = "ENGAGING" if enable else "RELEASING"
+        self.get_logger().info(f'{state} vacuum gripper...')
+        (self._attach_pub if enable else self._detach_pub).publish(Empty())
+        time.sleep(1.5)
+
+    def move_arm_to_joint_angles(self, angles, duration_sec=4):
+        """Generic helper function to send the arm to any 6-DOF joint configuration."""
+        if not self._arm_client.wait_for_server(timeout_sec=120.0):
+            self.get_logger().error(
+                'Arm action server /lite6_traj_controller/follow_joint_trajectory '
+                'never appeared. Is lite6_traj_controller active? Check with: '
+                'ros2 control list_controllers')
+            return False
+
+
+        goal_msg = FollowJointTrajectory.Goal()
+        goal_msg.trajectory.joint_names = [
+            'arm_joint1', 'arm_joint2', 'arm_joint3', 
+            'arm_joint4', 'arm_joint5', 'arm_joint6'
+        ]
+
         point = JointTrajectoryPoint()
-        point.positions = [float(a) for a in angles]
-        point.time_from_start = Duration(sec=int(duration_sec), nanosec=0)
-        goal.trajectory.points.append(point)
-        return goal
+        point.positions = angles 
+        point.time_from_start = Duration(sec=duration_sec, nanosec=0)
+        goal_msg.trajectory.points.append(point)
 
-    # --- the tick loop ------------------------------------------------------
+        # Every wait below is bounded, so a misbehaving controller will show an
+        # error instead of an indefinite hang with no output.
+        send_goal_future = self._arm_client.send_goal_async(goal_msg)
+        rclpy.spin_until_future_complete(self, send_goal_future, timeout_sec=15.0)
+        if not send_goal_future.done():
+            self.get_logger().error('Arm trajectory goal was never acknowledged!')
+            return False
+
+        goal_handle = send_goal_future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error('Arm trajectory goal was rejected!')
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=180.0)
+        if not result_future.done():
+            self.get_logger().error('Arm trajectory did not finish in time!')
+            return False
+        return True
+
+    def _amcl_cb(self, msg):
+        covariance = msg.pose.covariance
+        self.state['converged'] = (covariance[0] < COVARIANCE )and (covariance[7] < COVARIANCE) and (covariance[35] < COVARIANCE)
+        self.last_cov = (covariance[0], covariance[7])
+        self.get_logger().info(
+            f'[AMCL] cov x={covariance[0]:.3f} y={covariance[7]:.3f} '
+            f'yaw={covariance[35]:.3f} converged={self.state["converged"]}',
+            throttle_duration_sec=2.0)
+    # =========================================================================
+    # THE MAIN MISSION SEQUENCE
+    # =========================================================================
+
 
     def run_mission(self):
-        """Build the tree and start ticking it. Returns immediately; main() spins."""
         self.get_logger().info('Starting mission.')
 
-        # Boxes are looked up BY NAME (constants above), never by position in
-        # the yaml, so reordering shelves.yaml cannot send the robot to the
-        # wrong box.
+        # Ensure gripper starts in a known-detached state
+        time.sleep(10.0)  # allow ROS->bridge->gz discovery to complete across all hops
+        self._detach_pub.publish(Empty())
+        time.sleep(10.0)
+
+        # Load waypoints. Which box the cube is placed on depends on the grade,
+        # so both boxes are looked up BY NAME through the constants at the top
+        # of this file rather than by their position in shelves.yaml. Indexing
+        # into the list instead would tie the mission to the order of that file
+        # and quietly send the robot to the wrong box when it changed.
         home_base = load_home_base()
         pick_pose = load_shelf(self.source_box)
         drop_pose = load_shelf(self.drop_box)
 
-        root = build_tree(self, home_base, pick_pose, drop_pose)
-        self.tree = py_trees.trees.BehaviourTree(root)
-        self._timer = self.create_timer(TICK_PERIOD_SEC, self._tick)
+        tree = py_trees.trees.BehaviourTree(build_full_tree(self, pick_pose, drop_pose))
+        snapshot = py_trees.visitors.SnapshotVisitor()
+        tree.visitors.append(snapshot)
 
-    def _tick(self):
-        self.tree.tick()
-        root = self.tree.root
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            tree.tick()
 
-        # Print the tree only when something changed, not 10 times a second.
-        snapshot = py_trees.display.unicode_tree(root, show_status=True)
-        if snapshot != self._last_snapshot:
-            self.get_logger().info('\n' + snapshot)
-            self._last_snapshot = snapshot
+            if snapshot.visited != snapshot.previously_visited:
+                print(py_trees.display.unicode_tree(
+                    tree.root, show_status=True,
+                    visited=snapshot.visited,
+                    previously_visited=snapshot.previously_visited,
+                    show_only_visited=True))
 
-        if root.status in (Status.SUCCESS, Status.FAILURE):
-            self.success = root.status == Status.SUCCESS
-            self.get_logger().info(
-                'MISSION SUCCEEDED.' if self.success else 'MISSION FAILED.')
-            self._timer.cancel()
-            self.done = True
+            status = tree.root.status
+            if status in (Status.SUCCESS, Status.FAILURE):
+                self.get_logger().info(f'Mission finished: {status.name}')
+                print(py_trees.display.unicode_tree(tree.root, show_status=True))
+                break
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. BEHAVIOUR LEAVES
-#
-# Lifecycle of a py_trees leaf (see py_trees docs, "Behaviours"):
-#   initialise()  called when the leaf is entered, i.e. the first tick after it
-#                 was not RUNNING. Start your work here.
-#   update()      called every tick while the leaf is the active one. Return
-#                 Status.RUNNING / SUCCESS / FAILURE. Must not block.
-#   terminate(s)  called when the leaf stops: after SUCCESS/FAILURE, or when it
-#                 is interrupted (s == Status.INVALID). Cancel work here.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def call_to_status(state: str) -> Status:
-    """Map an AsyncActionCall state onto a BT status."""
-    if state == AsyncActionCall.SUCCEEDED:
-        return Status.SUCCESS
-    if state in (AsyncActionCall.FAILED, AsyncActionCall.IDLE):
-        return Status.FAILURE
-    return Status.RUNNING
+        return True
 
 
-class UndockLeaf(py_trees.behaviour.Behaviour):
-    """Leave the charging dock. Succeeds at once if the robot is already off it."""
-
-    def __init__(self, ros_node: MissionNode, name='Undock'):
-        super().__init__(name)
-        self.ros = ros_node
-        self.call = AsyncActionCall(
-            ros_node, ros_node.undock_client, 'undock', UNDOCK_TIMEOUT_SEC)
-
-    def initialise(self):
-        if self.ros.is_docked is False:
-            # Already off the dock (e.g. the mission was restarted): nothing to do.
-            return
-        self.call.start(Undock.Goal())
-
-    def update(self):
-        if self.ros.is_docked is False and not self.call.in_flight:
-            return Status.SUCCESS
-        state = self.call.poll()
-        if state == AsyncActionCall.SUCCEEDED:
-            return Status.SUCCESS
-        if state in (AsyncActionCall.FAILED, AsyncActionCall.IDLE):
-            return Status.FAILURE
-        return Status.RUNNING
-
-    def terminate(self, new_status):
-        # INVALID means we were interrupted while still running.
-        if new_status == Status.INVALID:
-            self.call.cancel()
-
-
-class NavigateToLeaf(py_trees.behaviour.Behaviour):
-    """Drive to `pose` (map frame) with Nav2's NavigateToPose action.
-
-    Obstacle avoidance is NOT done here: Nav2 replans and avoids the walking
-    person by itself. This leaf only sends the goal and reports the outcome.
-    """
-
-    def __init__(self, ros_node: MissionNode, pose: PoseStamped, name='NavigateTo'):
-        super().__init__(name)
-        self.ros = ros_node
-        self.pose = pose
-        self.call = AsyncActionCall(
-            ros_node, ros_node.nav_client, name, NAV_TIMEOUT_SEC)
-
-    def initialise(self):
-        self.call.start(self.ros.make_nav_goal(self.pose))
-
-    def update(self):
-        return call_to_status(self.call.poll())
-
-    def terminate(self, new_status):
-        if new_status == Status.INVALID:
-            self.call.cancel()
-
-
-class MoveArmLeaf(py_trees.behaviour.Behaviour):
-    """Move the arm to a joint configuration (list of 6 angles, radians)."""
-
-    def __init__(self, ros_node: MissionNode, angles, name='MoveArm', duration_sec=4):
-        super().__init__(name)
-        self.ros = ros_node
-        self.angles = angles
-        self.duration_sec = duration_sec
-        self.call = AsyncActionCall(
-            ros_node, ros_node.arm_client, name, ARM_TIMEOUT_SEC)
-
-    def initialise(self):
-        self.call.start(self.ros.make_arm_goal(self.angles, self.duration_sec))
-
-    def update(self):
-        state = self.call.poll()
-        if state == AsyncActionCall.FAILED and self.call.result is not None:
-            # The controller has a 0.01 rad goal tolerance (arm_controllers.yaml);
-            # a non-zero error_code here usually means it was not met in time.
-            self.ros.get_logger().error(
-                f'[{self.name}] error_code={self.call.result.error_code} '
-                f'{self.call.result.error_string}')
-        return call_to_status(state)
-
-    def terminate(self, new_status):
-        if new_status == Status.INVALID:
-            self.call.cancel()
-
-
-class SetVacuumLeaf(py_trees.behaviour.Behaviour):
-    """Attach (True) or detach (False) the cube, then wait for it to settle."""
-
-    def __init__(self, ros_node: MissionNode, enable: bool, name='SetVacuum',
-                 settle_sec=VACUUM_SETTLE_SEC):
-        super().__init__(name)
-        self.ros = ros_node
-        self.enable = enable
-        self.settle_sec = settle_sec
-        self._t0 = None
-
-    def initialise(self):
-        self._t0 = None          # not sent yet: wait for the bridge to subscribe
-        self._t_enter = self.ros.now_sec()
-
-    def update(self):
-        now = self.ros.now_sec()
-        if self._t0 is None:
-            if not self.ros.vacuum_ready(self.enable):
-                if now - self._t_enter > VACUUM_READY_TIMEOUT_SEC:
-                    self.ros.get_logger().error(
-                        f'[{self.name}] nobody subscribes to the gripper topic')
-                    return Status.FAILURE
-                return Status.RUNNING
-            self.ros.set_vacuum(self.enable)
-            self._t0 = now
-            return Status.RUNNING
-        # Re-send while settling: cheap insurance against a dropped message, and
-        # attach/detach are idempotent on the Gazebo side.
-        self.ros.set_vacuum(self.enable, log=False)
-        # Sim-time wait, no time.sleep(): sleeping would freeze every other
-        # callback and use wall time, which is wrong in a simulation.
-        if now - self._t0 >= self.settle_sec:
-            return Status.SUCCESS
-        return Status.RUNNING
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. THE TREE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def go_to_box(ros_node: MissionNode, box_pose, label):
-    """Retry( Sequence( drive to the approach point, then to the box pose ) ).
-
-    A failed attempt restarts from the approach point, so a retry always ends
-    with a straight head-on approach rather than a sideways one.
-    """
-    return py_trees.decorators.Retry(
-        f'RetryGo{label}',
-        py_trees.composites.Sequence(name=f'Go{label}', memory=True, children=[
-            NavigateToLeaf(ros_node, approach_pose(box_pose, APPROACH_BACKOFF_M),
-                           name=f'NavigateTo{label}Approach'),
-            NavigateToLeaf(ros_node, box_pose, name=f'NavigateTo{label}'),
-        ]),
-        num_failures=3)
-
-
-def build_tree(ros_node: MissionNode, home_base, pick_pose, drop_pose):
-    """Return the root behaviour of the mission tree.
-
-        Sequence(memory) Mission
-          detach -> fold arm -> undock
-          -> Retry(3, approach point -> source box)
-          -> arm to ARM_PICK -> attach -> fold arm
-          -> Retry(3, approach point -> target box)
-          -> arm to ARM_PLACE -> detach -> fold arm
-
-    memory=True: the Sequence resumes at the child that was RUNNING instead of
-    re-running the ones that already succeeded (no second undock after arriving
-    at a box). Only navigation is retried: it is the step that can fail for
-    reasons that go away on a second try (a pedestrian in the way, a stuck
-    controller). An arm or gripper failure means something is genuinely wrong,
-    so the mission stops and says which step failed.
-
-    The first detach is not cosmetic: the gripper's DetachableJoint starts the
-    simulation ATTACHED to the cube, i.e. the robot is welded to a cube 7.5 m
-    away until it is released.
-    """
-    # Fail now, not after the robot has already driven to the box.
-    if ARM_PICK is None or ARM_PLACE is None:
-        raise ValueError('ARM_PICK / ARM_PLACE are still None; set them at the top')
-
-    # Every leaf object may appear in the tree only once, and names show up in
-    # the log, so the repeated actions (detach, arm to safe) get distinct names.
-    root = py_trees.composites.Sequence(name='Mission', memory=True, children=[
-        SetVacuumLeaf(ros_node, enable=False, name='DetachCubeInit'),
-        # Fold the arm before the base moves: low centre of mass while driving.
-        MoveArmLeaf(ros_node, ARM_SAFE, name='MoveArmSafeInit'),
-        UndockLeaf(ros_node),
-        go_to_box(ros_node, pick_pose, 'Source'),
-        MoveArmLeaf(ros_node, ARM_PICK, name='MoveArmPick'),
-        SetVacuumLeaf(ros_node, enable=True, name='AttachCube'),
-        MoveArmLeaf(ros_node, ARM_SAFE, name='MoveArmSafeAfterPick'),
-        go_to_box(ros_node, drop_pose, 'Target'),
-        MoveArmLeaf(ros_node, ARM_PLACE, name='MoveArmPlace'),
-        SetVacuumLeaf(ros_node, enable=False, name='DetachCube'),
-        MoveArmLeaf(ros_node, ARM_SAFE, name='MoveArmSafeAfterPlace'),
-    ])
-    return root
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)
@@ -621,16 +716,14 @@ def main(args=None):
 
     try:
         node.run_mission()
-        while rclpy.ok() and not node.done:
-            rclpy.spin_once(node, timeout_sec=0.1)
     except KeyboardInterrupt:
-        node.get_logger().info('Mission interrupted by user.')
+        node.get_logger().info("Mission interrupted by user.")
     except Exception as e:
-        node.get_logger().fatal(f'Mission failed: {e!r}')
+        node.get_logger().fatal(f"Mission failed: {str(e)}")
+        node.get_logger().fatal(f"Mission failed:\n{traceback.format_exc()}")
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
