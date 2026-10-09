@@ -111,48 +111,81 @@ cd src/Warehouse_robot/warehouse_inventory_robot && python -m pytest test/test_m
 | 某一步变成失败、任务结束 | 记下终端 2 最后打印的那棵树，看是哪一步失败 |
 | 登录卡住或图形界面卡死 | 多半是磁盘配额满了，用 `fs quota` 检查，清理 `~/.cache` |
 
-## 七、使用队友的代码（A 级，分支 `teammate-grade-a`）
+## 七、A 级（分支 `grade-a`）
 
-队友的 `mission_node.py` 和 `mission.launch.py` 放在单独的分支 `teammate-grade-a` 上。
-两套代码的包名和可执行文件名相同，不能同时编译，所以通过切换分支来选用，
-`main` 分支保持我们自己的 C 级版本。
-
-切换到队友的代码并重新编译任务包：
+`grade-a` 分支上的代码同时支持 E、C、A 三个等级，由 `GRADE` 决定。切换到这个分支：
 
 ```bash
-git fetch && git checkout teammate-grade-a && colcon build --base-paths src/Warehouse_robot --packages-select warehouse_inventory_robot
+git fetch && git checkout grade-a && colcon build --base-paths src/Warehouse_robot --packages-select warehouse_inventory_robot
 ```
 
-切回我们自己的版本：
+然后重新 `source install/setup.bash`。
 
-```bash
-git checkout main && colcon build --base-paths src/Warehouse_robot --packages-select warehouse_inventory_robot
-```
-
-切换后都要重新 `source install/setup.bash`。
-
-### 用队友的代码跑 A 级
-
-**必须用 `GRADE=a` 这种环境变量写法**：他的启动文件靠环境变量 `GRADE`
-来决定里程计话题，只写 `grade:=a` 不够。
-
-终端 1：
+### 终端 1：启动仿真
 
 ```bash
 GRADE=a ros2 launch warehouse_inventory_robot mission.launch.py
 ```
 
-等日志里出现 `Managed nodes are active`（他用的是 Nav2 自带的生命周期管理器）。
-然后在 RViz 里选 **Publish Point** 工具，在地图上点一个位置，把机器人传送过去
-（这一步模拟 TA 的操作，要在启动任务节点之前做；不要用 2D Pose Estimate）。
+等日志里出现 `docking_server: active`（地图、AMCL、导航栈都激活了）。
 
-终端 2：
+### 模拟 TA 传送机器人（答辩时由 TA 操作）
+
+在 RViz 里选 **Publish Point** 工具，在地图上点一个空地，机器人连同充电座会被传送过去，
+朝向随机。**要在启动任务节点之前做**；不要用 2D Pose Estimate（那等于直接告诉 AMCL 答案）。
+
+**不要点在五个大货架（shelf_big）里面。** 它们的碰撞体是一整块 2.1 × 18 m、6 m 高的实心盒子，
+但激光雷达看到的是镂空的货架模型，所以地图上那里几乎全是空地，传送工具也不会拒绝。
+机器人被传进去以后机械臂卡在碰撞体里，完全动不了（实测 (-9, -14)：机械臂折叠失败，任务失败）。
+这五块区域（地图坐标）：
+
+| 货架 | x 范围 | y 范围 |
+|---|---|---|
+| shelf_big_0 | -10.05 ~ -7.95 | -22 ~ -4 |
+| shelf_big_2 | -3.05 ~ -0.95 | -22 ~ -4 |
+| shelf_big_1 | 4.95 ~ 7.05 | -22 ~ -4 |
+| shelf_big_3 | -5.5 ~ 12.5 | 7.95 ~ 10.05 |
+| shelf_big_4 | -10.3 ~ 7.7 | 16.95 ~ 19.05 |
+
+测试过的起点：原点（不传送）、(3, 1)、(-5.5, -14)、(10, -8)、(-6, 3)。
+
+### 终端 2：运行任务
 
 ```bash
 GRADE=a ros2 run warehouse_inventory_robot mission_node --ros-args -p use_sim_time:=true
 ```
 
-任务节点启动后会先等约 20 秒再开始（他代码里的固定等待），这是正常的。
-之后会做全局定位：撒满粒子、原地转、必要时往前开一段，直到 AMCL 收敛。
+### 应该看到的（终端 2）
 
-在这个分支上，第五节的逻辑测试不适用（测试是针对我们版本的代码写的）。
+- `Scattering AMCL particles over the whole map`：全局定位开始，机器人原地转圈、往开阔处开一小段。
+- `AMCL confident ... and scan matches map (...)`：AMCL 有信心，并且激光和地图对得上。
+- `LOCALIZED at (x, y, 朝向); map match in 4 directions: ...`：停下来朝四个方向各看一次，都对得上才算定位成功。
+- `[AlignToSourceBox] box face 0.2x m ahead`：到箱子前用激光对位。
+- 最后 `MISSION SUCCEEDED.`
+
+可能出现、但属于正常处理的日志：
+
+- `Verification failed ...` / `AMCL is confident but the scan contradicts the map ... scattering again`：
+  AMCL 收敛到了错误的位置（仓库有重复结构），程序识别出来后重新撒粒子，再定位一次。
+- `Localization lost ...`：行驶中激光长时间对不上地图，行为树会中断导航、重新定位后继续。
+
+**需要重启仿真**的情况（不是任务代码的问题）：
+
+- `[FoldArm ...] timed out after 60s`（连续几次），或终端 1 一直等不到 `docking_server: active`：
+  Gazebo 里的 controller_manager 卡死了，机械臂控制器（有时连轮子控制器 `diffdrive_controller`）没加载上，
+  终端 1 能看到 `spawner_lite6_traj_controller: waiting for service ...` 一直不动，
+  或 `spawner diffdrive_controller ... process has died`。这是仿真启动时偶发的问题
+  （WSL 上大约二十多次启动出现两次），Ctrl-C 终端 1，跑 `scripts/cleanup.sh`，重新启动。
+
+### 速度
+
+`launch/mission.launch.py` 的 `build_nav2_params()` 里最高速度 0.40 m/s、线加速度 0.25 m/s²
+（Nav2 参数都在那里用 Python 生成，没有单独的 yaml）。**加速度不要调大**：
+起步太猛时，装着机械臂的车身会后仰，前面的悬崖传感器"看不到地面"，Create 3 的悬崖反射接管，
+在原地反复倒车（实测 0.40 m/s、2.5 m/s²：7 m 的路程要 57–76 秒，记录到 47–67 次悬崖事件；
+0.25 m/s²：23 秒，0 次）。
+
+### 队友的版本
+
+队友原始的 A 级代码在分支 `teammate-grade-a`（切换方法同上，把分支名换掉）。
+它的启动命令同样要用 `GRADE=a` 环境变量写法。

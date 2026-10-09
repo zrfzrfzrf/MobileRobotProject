@@ -12,9 +12,13 @@ ME=$(id -u)
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 
 # PIDs of anything that belongs to a sim run, excluding this script's own group.
+# The last pattern is every ROS node binary of the pixi environment: Nav2's
+# controller_server is started without __node:= and hangs on shutdown, so
+# without it one orphan per run piled up (21 after a day of testing, all
+# answering as /controller_server alongside the next run's).
 sim_pids() {
     ps -u "$ME" -o pid=,pgid=,args= \
-      | grep -E 'gz sim|ros2 launch warehouse_inventory_robot|__node:=|parameter_bridge|rviz2' \
+      | grep -E 'gz sim|ros2 launch warehouse_inventory_robot|__node:=|parameter_bridge|rviz2|\.pixi/envs/[^ ]*/lib/' \
       | grep -v ' grep ' \
       | awk -v self="$SELF_PGID" '$2 != self {print $1}'
 }
